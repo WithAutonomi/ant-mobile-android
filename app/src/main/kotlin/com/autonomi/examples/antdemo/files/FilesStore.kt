@@ -39,6 +39,15 @@ data class PendingUpload(
     val error: String?,
 )
 
+/// Autonomi network connection status — mirrors the desktop `connectionStore`
+/// (`ant-ui/stores/connection.ts`): idle | connecting | connected | failed.
+sealed interface ConnectionStatus {
+    data object Idle : ConnectionStatus
+    data object Connecting : ConnectionStatus
+    data object Connected : ConnectionStatus
+    data class Failed(val reason: String) : ConnectionStatus
+}
+
 /// Backing store for the Files screens — the mobile analogue of the desktop
 /// app's files store (`ant-ui/stores/files.ts`). Drives real network operations
 /// through the bundled AntFfi AAR, with a quote → approve two-step upload and
@@ -53,6 +62,35 @@ object FilesStore {
     /// Non-null while an upload is being quoted / awaiting the user's Approve.
     var pendingUpload by mutableStateOf<PendingUpload?>(null)
         private set
+
+    /// Autonomi network connection status, driving the header indicator.
+    var connection by mutableStateOf<ConnectionStatus>(ConnectionStatus.Idle)
+        private set
+
+    /// Join the Autonomi network (build + start the P2P client from the devnet
+    /// manifest) and track status for the indicator. Idempotent — a no-op while
+    /// already connecting or connected. Called at launch and by the Retry action.
+    fun connectNetwork() {
+        if (connection is ConnectionStatus.Connecting || connection is ConnectionStatus.Connected) return
+        connection = ConnectionStatus.Connecting
+        scope.launch {
+            val next = try {
+                externalSignerClient()
+                ConnectionStatus.Connected
+            } catch (e: Throwable) {
+                ConnectionStatus.Failed(e.message ?: "connection failed")
+            }
+            withContext(Dispatchers.Main) { connection = next }
+        }
+    }
+
+    /// Force a fresh connection attempt (drops the cached client so a previously
+    /// failed build is retried, not reused).
+    fun retryConnection() {
+        esClient = null
+        connection = ConnectionStatus.Idle
+        connectNetwork()
+    }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val ids = AtomicLong(1)

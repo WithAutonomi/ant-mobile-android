@@ -1,6 +1,5 @@
 package com.autonomi.examples.antdemo.ui
 
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -59,6 +58,10 @@ fun AppShell() {
     val backStack by navController.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
     val title = DESTS.firstOrNull { it.route == currentRoute }?.label ?: "Autonomi"
+
+    // Join the Autonomi network at launch so the header indicator reflects
+    // connection status (mirrors the desktop connectionStore.startListening()).
+    LaunchedEffect(Unit) { com.autonomi.examples.antdemo.files.FilesStore.connectNetwork() }
 
     // Deep-link (`autonomi://…`) navigation: jump to the requested tab.
     val deepLinkTarget by com.autonomi.examples.antdemo.deeplink.DeepLinkNav.target.collectAsState()
@@ -120,16 +123,19 @@ private fun BottomNav(currentRoute: String?, navController: NavController) {
     }
 }
 
-/// Slim top header (desktop AppHeader: h-12, surface, bottom border, page title).
+/// Slim top header (desktop AppHeader: h-12, surface, bottom border, page title
+/// on the left, network connection indicator on the right).
 @Composable
 private fun HeaderBar(title: String) {
     androidx.compose.material3.Surface(color = MaterialTheme.colorScheme.surface) {
         androidx.compose.foundation.layout.Column {
-            Box(
+            androidx.compose.foundation.layout.Row(
                 Modifier.fillMaxWidth().height(48.dp).padding(horizontal = 16.dp),
-                contentAlignment = Alignment.CenterStart,
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = androidx.compose.foundation.layout.Arrangement.SpaceBetween,
             ) {
                 Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium)
+                NetworkIndicator()
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outline)
         }
