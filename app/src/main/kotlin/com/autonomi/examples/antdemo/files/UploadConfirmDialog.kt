@@ -97,6 +97,13 @@ fun UploadConfirmDialog() {
                                     color = MaterialTheme.colorScheme.primary, maxLines = 1)
                             }
                         }
+                        info.paymentType == "merkle" -> {
+                            costRow("Estimated max cost", "${formatAtto(merkleApproveUpperBound(info))} ANT", accent = true)
+                            costRow("Merkle tree depth", "${info.depth}")
+                            costRow("Gas", "paid at signing")
+                            Text("Large upload — paid in a single merkle-tree transaction. The exact cost is settled on-chain (a winning pool is selected at payment); you approve up to the estimate above.",
+                                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                         else -> {
                             costRow("Network storage cost", "${formatAtto(info.totalAmount)} ANT", accent = true)
                             costRow("Chunks to pay for", "${info.payments.size}")

@@ -100,5 +100,20 @@ fun formatAtto(atto: String): String {
     }
 }
 
+/// A safe over-estimate of the merkle payment in atto-tokens:
+/// `max(all candidate amounts across all pools) · 2^depth`. The contract charges
+/// `median16(winnerPool)·2^depth` and median16 ≤ max, so this is always enough
+/// to approve — no need to reimplement the on-chain winner/median selection.
+fun merkleApproveUpperBound(info: uniffi.ant_ffi.PreparedUploadInfo): String {
+    var maxAmt = java.math.BigInteger.ZERO
+    for (pc in info.poolCommitments) {
+        for (c in pc.candidates) {
+            val amt = c.amount.toBigIntegerOrNull() ?: continue
+            if (amt > maxAmt) maxAmt = amt
+        }
+    }
+    return maxAmt.shiftLeft(info.depth.toInt()).toString()
+}
+
 private val dateFmt = SimpleDateFormat("MMM d, HH:mm", Locale.US)
 fun formatDate(epochMillis: Long): String = dateFmt.format(Date(epochMillis))

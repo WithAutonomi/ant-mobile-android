@@ -9,11 +9,20 @@ import java.math.BigInteger
 /// Function selectors are hard-coded (precomputed keccak256 of the signature):
 ///   approve(address,uint256)                    -> 0x095ea7b3
 ///   payForQuotes((address,uint256,bytes32)[])   -> 0xb6c2141b
+///   payForMerkleTree(uint8,(bytes32,(address,uint256)[16])[],uint64) -> 0x5460f240
 /// (Verified with `cast sig`; 0x77a23fd7 was wrong — no such function on the
 /// deployed PaymentVault, so calls reverted with empty data.)
 object EthCalldata {
     private const val APPROVE_SELECTOR = "095ea7b3"
     private const val PAY_FOR_QUOTES_SELECTOR = "b6c2141b"
+    private const val PAY_FOR_MERKLE_TREE_SELECTOR = "5460f240"
+
+    /// keccak256("MerklePaymentMade(bytes32,uint8,uint256,uint64)") — topic0 of
+    /// the event the PaymentVault emits from `payForMerkleTree`. `winnerPoolHash`
+    /// is `indexed`, so it lands in `topics[1]` of the matching receipt log; that
+    /// hash is what `finalizeUploadMerkle` needs.
+    const val MERKLE_PAYMENT_MADE_TOPIC0 =
+        "0x89f0ad3859fec321e325bcc553fe234bcad374789a86f7ba932067f3f05affec"
 
     /// ERC-20 `approve(spender, amount)`. `amount` is a base-10 string
     /// (atto-token amounts exceed Long).
@@ -40,6 +49,47 @@ object EthCalldata {
             sb.append(wordBytes32(p.quoteHash))
         }
         return "0x" + PAY_FOR_QUOTES_SELECTOR + sb
+    }
+
+    /// One candidate node inside a pool commitment (mirrors the FFI
+    /// `CandidateNodeEntry`).
+    data class MerkleCandidate(
+        val rewardsAddress: String,  // 0x… address
+        val amount: String,          // base-10 atto-token amount (node price)
+    )
+
+    /// One pool commitment (mirrors the FFI `PoolCommitmentEntry`). `candidates`
+    /// must contain exactly 16 entries.
+    data class PoolCommitment(
+        val poolHash: String,                // 0x… 32-byte hash
+        val candidates: List<MerkleCandidate>,  // exactly 16
+    )
+
+    /// PaymentVault `payForMerkleTree(uint8 depth, PoolCommitment[], uint64 ts)`
+    /// where `PoolCommitment = (bytes32 poolHash, (address,uint256)[16] candidates)`.
+    ///
+    /// `PoolCommitment` is a *fully static* tuple — bytes32 (1 word) + a fixed
+    /// `[16]` of static `(address,uint256)` (32 words) = 33 words, no dynamic
+    /// parts. So the dynamic `PoolCommitment[]` needs no per-element offsets:
+    /// just `length` then each element's 33 words consecutively. The top-level
+    /// arg head is 3 words (depth · offset 0x60 · ts).
+    fun payForMerkleTree(depth: Int, poolCommitments: List<PoolCommitment>, timestamp: BigInteger): String {
+        val sb = StringBuilder()
+        sb.append(wordUint(BigInteger.valueOf(depth.toLong())))  // head 0: depth (uint8)
+        sb.append(wordUint(BigInteger.valueOf(0x60)))            // head 1: offset to array (3 head words)
+        sb.append(wordUint(timestamp))                           // head 2: merklePaymentTimestamp
+        sb.append(wordUint(BigInteger.valueOf(poolCommitments.size.toLong())))  // array length
+        for (pc in poolCommitments) {
+            sb.append(wordBytes32(pc.poolHash))
+            require(pc.candidates.size == 16) {
+                "each pool commitment must have exactly 16 candidates, got ${pc.candidates.size}"
+            }
+            for (c in pc.candidates) {
+                sb.append(wordAddress(c.rewardsAddress))
+                sb.append(wordUint(c.amount))
+            }
+        }
+        return "0x" + PAY_FOR_MERKLE_TREE_SELECTOR + sb
     }
 
     // MARK: word encoders — each returns a 64-hex-char / 32-byte word

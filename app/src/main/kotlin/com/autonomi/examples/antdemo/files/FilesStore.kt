@@ -146,11 +146,28 @@ object FilesStore {
             try {
                 val c = externalSignerClient()
                 if (info.alreadyStored) {
-                    val r = withContext(Dispatchers.IO) { c.finalizeUpload(info.uploadId, emptyMap()) }
+                    // Finalize must be routed by payment shape even when nothing
+                    // is owed — the FFI rejects a mis-routed finalize. Merkle
+                    // accepts any valid 32-byte winner hash here.
+                    val r = withContext(Dispatchers.IO) {
+                        if (info.paymentType == "merkle") {
+                            c.finalizeUploadMerkle(info.uploadId, anyWinnerHash(info))
+                        } else {
+                            c.finalizeUpload(info.uploadId, emptyMap())
+                        }
+                    }
                     completeUpload(id, visibility, r.address ?: info.dataMapAddress, r.dataMap, "already stored", context)
                     return@launch
                 }
                 val evm = parseManifestEvm()
+
+                // Large uploads settle via a single `payForMerkleTree` call
+                // instead of per-quote `payForQuotes`; the flow differs enough to
+                // live in its own method.
+                if (info.paymentType == "merkle") {
+                    runMerklePayment(id, info, visibility, evm, c, context)
+                    return@launch
+                }
 
                 setUpload(id) { it.copy(status = FileStatus.AwaitingApproval) }
                 val approveTx = withContext(Dispatchers.Main) {
@@ -192,6 +209,88 @@ object FilesStore {
                 setUpload(id) { it.copy(status = FileStatus.Failed, error = e.message, stage = null) }
             }
         }
+    }
+
+    /// Merkle payment path: approve → `payForMerkleTree` → read the winning pool
+    /// from the `MerklePaymentMade` event → finalize with that winner hash.
+    /// Unlike the wave path there's a single vault call and the total cost isn't
+    /// known until the contract picks a winner, so we approve a safe upper bound.
+    private suspend fun runMerklePayment(
+        id: Long, info: PreparedUploadInfo, visibility: String, evm: DevnetEvm, c: Client, context: Context,
+    ) {
+        val pools = info.poolCommitments.map { pc ->
+            EthCalldata.PoolCommitment(
+                poolHash = pc.poolHash,
+                candidates = pc.candidates.map {
+                    EthCalldata.MerkleCandidate(rewardsAddress = it.rewardsAddress, amount = it.amount)
+                },
+            )
+        }
+
+        // The contract charges `median16(winnerPool)·2^depth` via transferFrom;
+        // median16 ≤ the largest candidate amount, so max·2^depth always suffices
+        // to approve without reimplementing the on-chain winner/median logic.
+        val approveAmount = merkleApproveUpperBound(info)
+
+        setUpload(id) { it.copy(status = FileStatus.AwaitingApproval) }
+        val approveTx = withContext(Dispatchers.Main) {
+            evm.chainId?.let { WalletConnectManager.switchChain(it) }
+            WalletConnectManager.sendTransaction(
+                to = evm.tokenAddress,
+                data = EthCalldata.approve(evm.vaultAddress, approveAmount),
+            )
+        }
+        waitForReceipt(evm.rpcUrl, approveTx)
+
+        setUpload(id) { it.copy(status = FileStatus.Paying) }
+        val payData = EthCalldata.payForMerkleTree(
+            depth = info.depth.toInt(),
+            poolCommitments = pools,
+            timestamp = info.merklePaymentTimestamp.toLong().toBigInteger(),
+        )
+        val payTx = withContext(Dispatchers.Main) {
+            WalletConnectManager.sendTransaction(to = evm.vaultAddress, data = payData)
+        }
+        waitForReceipt(evm.rpcUrl, payTx)
+
+        // The winning pool is selected on-chain — recover its hash from the
+        // MerklePaymentMade log; finalizeUploadMerkle needs it.
+        val winnerPoolHash = parseWinnerPoolHash(evm.rpcUrl, payTx)
+            ?: throw RuntimeException("payForMerkleTree receipt had no MerklePaymentMade event")
+
+        setUpload(id) {
+            it.copy(status = FileStatus.Uploading, stage = "storing", stageDone = 0, stageTotal = 0)
+        }
+        val r = withContext(Dispatchers.IO) {
+            c.finalizeUploadMerkleWithProgress(info.uploadId, winnerPoolHash, progressListener(id, isUpload = true))
+        }
+        // Gas was paid by the external wallet (not ant-core); read it back from
+        // the approve + payForMerkleTree receipts. Exact ANT is what the vault
+        // pulled, which we don't reparse — label it "merkle".
+        val gas = gasSpentEth(evm.rpcUrl, listOf(approveTx, payTx))
+        val cost = "${r.chunksStored} chunk(s) · merkle" + (gas?.let { " · $it ETH gas" } ?: "")
+        completeUpload(id, visibility, r.address ?: info.dataMapAddress, r.dataMap, cost, context)
+    }
+
+    /// A valid 32-byte winner hash for the already-stored merkle case, where the
+    /// FFI accepts any hash (no payment was made). Prefer a real pool hash.
+    private fun anyWinnerHash(info: PreparedUploadInfo): String =
+        info.poolCommitments.firstOrNull()?.poolHash ?: "0x" + "0".repeat(64)
+
+    /// Pull the indexed `winnerPoolHash` (topics[1]) out of the MerklePaymentMade
+    /// log in a payForMerkleTree receipt. It's already a 0x-prefixed 32-byte hash.
+    private suspend fun parseWinnerPoolHash(rpcUrl: String, txHash: String): String? {
+        val body = """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":["$txHash"]}"""
+        val resp = try { withContext(Dispatchers.IO) { httpPost(rpcUrl, body) } } catch (e: Exception) { return null }
+        val logs = JSONObject(resp).optJSONObject("result")?.optJSONArray("logs") ?: return null
+        val topic0 = EthCalldata.MERKLE_PAYMENT_MADE_TOPIC0.lowercase()
+        for (i in 0 until logs.length()) {
+            val topics = logs.getJSONObject(i).optJSONArray("topics") ?: continue
+            if (topics.length() >= 2 && topics.getString(0).lowercase() == topic0) {
+                return topics.getString(1)
+            }
+        }
+        return null
     }
 
     private fun completeUpload(
