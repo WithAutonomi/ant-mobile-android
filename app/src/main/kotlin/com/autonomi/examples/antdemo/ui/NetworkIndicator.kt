@@ -1,12 +1,9 @@
 package com.autonomi.examples.antdemo.ui
 
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -32,33 +29,31 @@ fun NetworkIndicator() {
     val success = Color(0xFF22C55E)
 
     when (FilesStore.connection) {
-        is ConnectionStatus.Idle, is ConnectionStatus.Connecting -> Pill(border = outline) {
+        is ConnectionStatus.Idle, is ConnectionStatus.Connecting -> Status {
             CircularProgressIndicator(
                 modifier = Modifier.size(10.dp), strokeWidth = 1.5.dp, color = muted,
             )
             Text("Connecting", fontSize = 11.sp, color = muted)
         }
-        is ConnectionStatus.Connected -> Pill(border = outline) {
+        is ConnectionStatus.Connected -> Status {
             Text("●", fontSize = 11.sp, color = success)
             Text("Network", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface)
         }
-        is ConnectionStatus.Failed -> Pill(
-            border = error.copy(alpha = 0.35f),
-            onClick = { FilesStore.retryConnection() },
-        ) {
+        is ConnectionStatus.Failed -> Status(onClick = { FilesStore.retryConnection() }) {
             Text("●", fontSize = 11.sp, color = error)
             Text("Offline · Retry", fontSize = 11.sp, color = error, fontWeight = FontWeight.Medium)
         }
     }
 }
 
+/// The indicator sits plainly on the HeaderBar with no border/box — just a dot
+/// (or spinner) and a label. The failure state is tappable to retry.
 @Composable
-private fun Pill(border: Color, onClick: (() -> Unit)? = null, content: @Composable () -> Unit) {
-    val shape = RoundedCornerShape(8.dp)
-    var m = Modifier.border(1.dp, border, shape)
+private fun Status(onClick: (() -> Unit)? = null, content: @Composable () -> Unit) {
+    var m: Modifier = Modifier
     if (onClick != null) m = m.clickable(onClick = onClick)
     Row(
-        modifier = m.padding(horizontal = 8.dp, vertical = 4.dp),
+        modifier = m,
         horizontalArrangement = Arrangement.spacedBy(5.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) { content() }
