@@ -117,6 +117,7 @@ object FilesStore {
         val id = ids.getAndIncrement()
         uploads.add(0, FileEntry(id, FileKind.Upload, name, bytes.size.toLong(),
             FileStatus.Quoting, System.currentTimeMillis()))
+        syncTransferService()
         if (WalletConnectManager.state.value.address == null) {
             scope.launch {
                 try { devnetUpload(id, bytes) }
@@ -386,6 +387,7 @@ object FilesStore {
         val fileName = suggestedName ?: "download-${key.take(16)}.bin"
         downloads.add(0, FileEntry(id, FileKind.Download, rowName, 0, FileStatus.Downloading,
             System.currentTimeMillis(), address = addressHex, stage = "downloading"))
+        syncTransferService()
         scope.launch {
             try {
                 val c = externalSignerClient()
@@ -490,11 +492,37 @@ object FilesStore {
 
     // ---- mutation helpers (replace-by-id keeps the list observable) ----
 
-    private fun setUpload(id: Long, transform: (FileEntry) -> FileEntry) = replace(uploads, id, transform)
-    private fun setDownload(id: Long, transform: (FileEntry) -> FileEntry) = replace(downloads, id, transform)
+    private fun setUpload(id: Long, transform: (FileEntry) -> FileEntry) {
+        replace(uploads, id, transform); syncTransferService()
+    }
+    private fun setDownload(id: Long, transform: (FileEntry) -> FileEntry) {
+        replace(downloads, id, transform); syncTransferService()
+    }
 
     private fun replace(list: MutableList<FileEntry>, id: Long, transform: (FileEntry) -> FileEntry) {
         val idx = list.indexOfFirst { it.id == id }
         if (idx >= 0) list[idx] = transform(list[idx])
+    }
+
+    // ── Background-transfer foreground service (V2-563) ──
+
+    /// App context for starting the transfer service. Set once at launch.
+    @Volatile private var appContext: Context? = null
+
+    /// Wire the application context so transfers can keep a foreground service
+    /// alive while backgrounded. Call once from the Activity.
+    fun attach(context: Context) { appContext = context.applicationContext }
+
+    /// Number of uploads + downloads currently in progress. Read by the transfer
+    /// service to decide whether to keep running (it reconciles against this on
+    /// every start command, so a race between start/stop can't strand it).
+    fun activeTransferCount(): Int =
+        uploads.count { it.status.inProgress } + downloads.count { it.status.inProgress }
+
+    /// Start/stop the transfer foreground service to match the active-transfer
+    /// count. Called after every transfer state change (and on each new row).
+    private fun syncTransferService() {
+        val ctx = appContext ?: return
+        com.autonomi.examples.antdemo.transfer.TransferService.sync(ctx, activeTransferCount())
     }
 }
