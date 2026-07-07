@@ -27,4 +27,21 @@ enum class AutonomiChain(
 
     /// CAIP-2 id used to build a WalletConnect `eip155:<id>` blockchain.
     val caip2: String get() = "eip155:$chainId"
+
+    /// Public JSON-RPC endpoint for read-only balance queries on this chain.
+    val rpcUrl: String
+        get() = when (this) {
+            ARBITRUM_ONE -> "https://arb1.arbitrum.io/rpc"
+            ARBITRUM_SEPOLIA -> "https://sepolia-rollup.arbitrum.io/rpc"
+        }
+
+    /// Whether the ERC-20 token address is a real (non-zero) deployment — the
+    /// Sepolia address is a per-devnet placeholder, so ANT balance is unknown there.
+    val hasKnownToken: Boolean
+        get() = tokenAddress != "0x0000000000000000000000000000000000000000"
+
+    companion object {
+        /// Map a connected wallet's chain id back to a known Autonomi chain.
+        fun fromChainId(chainId: Int): AutonomiChain? = entries.firstOrNull { it.chainId == chainId }
+    }
 }

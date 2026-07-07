@@ -1,6 +1,7 @@
 package com.autonomi.examples.antdemo
 
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -53,11 +54,24 @@ fun WalletScreen(navController: NavController) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
 
-        // Mock balances (as the desktop wallet page shows token holdings).
+        // Live balances for the connected wallet on its current chain (desktop
+        // wallet page shows token holdings). Read-only; "—" when not connected
+        // or the chain/token is unknown.
         Card {
-            Text("Balances", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-            BalanceRow("ANT", "715.17361")
-            BalanceRow("ETH", "0.01396")
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Balances", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                if (wallet.address != null) {
+                    Text("Refresh", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.clickable { WalletConnectManager.refreshBalances() })
+                }
+            }
+            BalanceRow("ANT", wallet.antBalance ?: "—")
+            BalanceRow("ETH", wallet.ethBalance ?: "—")
+            if (wallet.address == null) {
+                Text("Connect a wallet to see balances.", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
 
         if (wallet.address != null) {

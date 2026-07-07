@@ -10,9 +10,14 @@ import com.reown.appkit.client.models.request.Request
 import com.reown.appkit.client.models.request.SentRequestResult
 import com.reown.appkit.presets.AppKitChainsPresets
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /// WalletConnect spike (Android): connect an external self-custody wallet via
 /// Reown AppKit and have it sign an Autonomi payment transaction. The mobile
@@ -29,6 +34,10 @@ data class WalletState(
     val chainId: String? = null,
     val lastTxHash: String? = null,
     val status: String = "Not connected",
+    /// Live ANT / ETH balances on the connected chain (read-only, cosmetic).
+    /// Null when not connected, chain/token unknown, or the read failed.
+    val antBalance: String? = null,
+    val ethBalance: String? = null,
 )
 
 object WalletConnectManager {
@@ -38,6 +47,9 @@ object WalletConnectManager {
     // Pending eth_sendTransaction → resolved by the delegate's response callback.
     private var pending: CompletableDeferred<String>? = null
     private var configured = false
+
+    // Background scope for read-only balance queries.
+    private val balanceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /// Call once from Application/Activity onCreate. Get a projectId from
     /// https://dashboard.reown.com.
@@ -87,6 +99,56 @@ object WalletConnectManager {
         } else {
             _state.value.copy(address = account.address, chainId = account.chain.id, status = "Connected")
         }
+        if (account != null) refreshBalances() else _state.value = _state.value.copy(antBalance = null, ethBalance = null)
+    }
+
+    /// Read the connected wallet's ANT + ETH balances from its chain's public RPC
+    /// (`eth_getBalance` for the gas token, ERC-20 `balanceOf` for ANT). Cosmetic
+    /// and read-only — unknown chain/token leaves a field null (UI shows "—").
+    fun refreshBalances() {
+        val s = _state.value
+        val address = s.address ?: return
+        val chainId = s.chainId?.substringAfterLast(':')?.toIntOrNull()
+        val chain = chainId?.let { AutonomiChain.fromChainId(it) }
+        if (chain == null) {
+            _state.value = s.copy(antBalance = null, ethBalance = null)
+            return
+        }
+        balanceScope.launch {
+            val eth = rpcResult(chain.rpcUrl, "eth_getBalance", """["$address","latest"]""")?.let { formatUnits(it, 6) }
+            val ant = if (chain.hasKnownToken) {
+                val data = "0x70a08231" + "0".repeat(24) + address.removePrefix("0x").lowercase()
+                rpcResult(chain.rpcUrl, "eth_call", """[{"to":"${chain.tokenAddress}","data":"$data"},"latest"]""")
+                    ?.let { formatUnits(it, 4) }
+            } else null
+            _state.value = _state.value.copy(antBalance = ant, ethBalance = eth)
+        }
+    }
+
+    /// One read-only JSON-RPC call; returns the `result` hex string or null.
+    private suspend fun rpcResult(rpcUrl: String, method: String, params: String): String? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val body = """{"jsonrpc":"2.0","id":1,"method":"$method","params":$params}"""
+                val conn = (java.net.URL(rpcUrl).openConnection() as java.net.HttpURLConnection).apply {
+                    requestMethod = "POST"; doOutput = true; connectTimeout = 10_000; readTimeout = 10_000
+                    setRequestProperty("Content-Type", "application/json")
+                }
+                conn.outputStream.use { it.write(body.toByteArray()) }
+                val resp = conn.inputStream.bufferedReader().use { it.readText() }
+                org.json.JSONObject(resp).optString("result").takeIf { it.startsWith("0x") }
+            }.getOrNull()
+        }
+
+    /// Format a 0x hex quantity as a token amount (÷1e18). Accumulates in Double —
+    /// fine for a display value (we only show a few decimals).
+    private fun formatUnits(hex: String, places: Int): String {
+        var v = 0.0
+        for (c in hex.lowercase()) {
+            val d = Character.digit(c, 16)
+            if (d >= 0) v = v * 16 + d
+        }
+        return String.format(java.util.Locale.US, "%.${places}f", v / 1e18)
     }
 
     /// Core: fire one JSON-RPC request to the connected wallet and await its
