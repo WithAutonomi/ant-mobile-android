@@ -3,6 +3,15 @@ plugins {
     id("org.jetbrains.kotlin.android") version "1.9.25"
 }
 
+// Reown 1.4.1's ChaChaPolyCodec throws "OutputLengthException: Output buffer too
+// short" when decrypting relay messages against bcprov 1.78.x (stricter AEAD
+// output-buffer handling). Reown's own BOM pulls 1.78.1; pin back to 1.77.
+configurations.all {
+    resolutionStrategy {
+        force("org.bouncycastle:bcprov-jdk18on:1.77")
+    }
+}
+
 android {
     namespace = "com.autonomi.examples.antdemo"
     compileSdk = 34
