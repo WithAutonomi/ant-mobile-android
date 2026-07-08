@@ -274,14 +274,24 @@ private fun openFile(context: Context, path: String) {
     // older/app-internal paths still go through FileProvider.
     val uri = if (path.startsWith("content://")) Uri.parse(path)
         else FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(path))
-    val intent = Intent(Intent.ACTION_SEND).apply {
-        type = "application/octet-stream"
-        putExtra(Intent.EXTRA_STREAM, uri)
-        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    // Resolve the real MIME so it opens in the default app for that type (gallery
+    // for images, PDF reader, …): from the stored type for content Uris, else the
+    // file extension.
+    val mime = (if (path.startsWith("content://")) context.contentResolver.getType(uri)
+        else android.webkit.MimeTypeMap.getSingleton()
+            .getMimeTypeFromExtension(File(path).extension.lowercase())) ?: "*/*"
+    val view = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, mime)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
     }
-    context.startActivity(
-        Intent.createChooser(intent, "Open datamap file").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-    )
+    // Prefer the default handler; fall back to an "Open with" chooser if none.
+    runCatching { context.startActivity(view) }.onFailure {
+        runCatching {
+            context.startActivity(
+                Intent.createChooser(view, "Open with").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        }
+    }
 }
 
 @Composable

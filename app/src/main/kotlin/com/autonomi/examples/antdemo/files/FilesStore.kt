@@ -488,6 +488,13 @@ object FilesStore {
     private fun saveDatamapToDownloads(context: Context, filename: String, contents: String): String? =
         saveToDownloads(context, filename, "application/octet-stream") { it.write(contents.toByteArray()) }
 
+    /// Best-effort MIME from a filename extension so a saved download indexes in
+    /// the gallery and opens in the right default app. Falls back to octet-stream.
+    private fun mimeOf(name: String): String =
+        android.webkit.MimeTypeMap.getSingleton()
+            .getMimeTypeFromExtension(name.substringAfterLast('.', "").lowercase())
+            ?: "application/octet-stream"
+
     /// Devnet fallback: the manifest wallet pays inside ant-core (single-shot).
     private suspend fun devnetUpload(id: Long, bytes: ByteArray) {
         val c = client()
@@ -546,7 +553,7 @@ object FilesStore {
                     }
                 }
                 val saved = withContext(Dispatchers.IO) {
-                    saveToDownloads(context, fileName, "application/octet-stream") { out ->
+                    saveToDownloads(context, fileName, mimeOf(fileName)) { out ->
                         tmp.inputStream().use { it.copyTo(out) }
                     }.also { tmp.delete() }
                 }
