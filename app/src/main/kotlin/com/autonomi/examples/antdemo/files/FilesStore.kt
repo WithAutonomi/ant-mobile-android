@@ -9,7 +9,6 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.autonomi.examples.antdemo.deeplink.AntUri
-import com.autonomi.examples.antdemo.wallet.EthCalldata
 import com.autonomi.examples.antdemo.wallet.WalletConnectManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -24,6 +23,9 @@ import uniffi.ant_ffi.Client
 import uniffi.ant_ffi.PreparedUploadInfo
 import uniffi.ant_ffi.ProgressListener
 import uniffi.ant_ffi.ProgressUpdate
+import uniffi.ant_ffi.TxReceipt
+import uniffi.ant_ffi.merkleWinnerPoolHash
+import uniffi.ant_ffi.waitForReceipt
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -299,49 +301,56 @@ object FilesStore {
                 }
                 val evm = parseManifestEvm()
 
-                // Large uploads settle via a single `payForMerkleTree` call
-                // instead of per-quote `payForQuotes`; the flow differs enough to
-                // live in its own method.
-                if (info.paymentType == "merkle") {
-                    runMerklePayment(id, info, visibility, evm, c, context)
-                    return@launch
-                }
-
+                // The SDK builds the exact ordered transactions to sign (approve
+                // + the payment call), including wave batching and the merkle
+                // approve upper-bound. Each pay tx carries the quote hashes it
+                // settles. All ABI encoding, receipt polling, and the merkle
+                // winner lookup now live in the SDK.
                 setUpload(id) { it.copy(status = FileStatus.AwaitingApproval) }
-                val approveTx = withContext(Dispatchers.Main) {
-                    evm.chainId?.let { WalletConnectManager.switchChain(it) }
-                    WalletConnectManager.sendTransaction(
-                        to = evm.tokenAddress,
-                        data = EthCalldata.approve(evm.vaultAddress, info.totalAmount),
-                    )
-                }
-                waitForReceipt(evm.rpcUrl, approveTx)
+                val txs = c.paymentTransactions(info.uploadId)
 
-                setUpload(id) { it.copy(status = FileStatus.Paying) }
-                val quotePayments = info.payments.map {
-                    EthCalldata.QuotePayment(rewardsAddress = it.rewardsAddress, amount = it.amount, quoteHash = it.quoteHash)
-                }
-                val payTx = withContext(Dispatchers.Main) {
-                    WalletConnectManager.sendTransaction(
-                        to = evm.vaultAddress,
-                        data = EthCalldata.payForQuotes(quotePayments),
-                    )
-                }
-                waitForReceipt(evm.rpcUrl, payTx)
+                // Point the wallet at the payment chain once, up front.
+                withContext(Dispatchers.Main) { WalletConnectManager.switchChain(evm.chainId) }
 
+                val txHashes = HashMap<String, String>()   // quoteHash -> txHash (wave finalize)
+                var merklePayTx: String? = null
+                var merkleVault: String? = null
+                var gasWei = java.math.BigInteger.ZERO
+                for (tx in txs) {
+                    if (tx.kind == "pay") setUpload(id) { it.copy(status = FileStatus.Paying) }
+                    val hash = withContext(Dispatchers.Main) {
+                        WalletConnectManager.sendTransaction(to = tx.to, data = tx.data)
+                    }
+                    val receipt = waitForReceipt(evm.rpcUrl, hash, 60UL)
+                    if (!receipt.success) throw RuntimeException("payment transaction reverted on-chain")
+                    gasWei = gasWei.add(weiOf(receipt))
+                    if (tx.kind == "pay") {
+                        for (qh in tx.quoteHashes) txHashes[qh] = hash
+                        if (info.paymentType == "merkle") { merklePayTx = hash; merkleVault = tx.to }
+                    }
+                }
+
+                val storeTotal = if (info.paymentType == "merkle") 0L else info.payments.size.toLong()
                 setUpload(id) {
-                    it.copy(status = FileStatus.Uploading, stage = "storing", stageDone = 0,
-                        stageTotal = info.payments.size.toLong())
+                    it.copy(status = FileStatus.Uploading, stage = "storing", stageDone = 0, stageTotal = storeTotal)
                 }
-                val txHashes = info.payments.associate { it.quoteHash to payTx }
-                val r = withContext(Dispatchers.IO) {
-                    c.finalizeUploadWithProgress(info.uploadId, txHashes, progressListener(id, isUpload = true))
+                val r = if (info.paymentType == "merkle") {
+                    val payTx = merklePayTx ?: throw RuntimeException("merkle payment produced no signed transaction")
+                    // The winning pool is chosen on-chain; the SDK reads it from
+                    // the payForMerkleTree receipt's MerklePaymentMade event.
+                    val winner = merkleWinnerPoolHash(evm.rpcUrl, merkleVault!!, payTx)
+                    withContext(Dispatchers.IO) {
+                        c.finalizeUploadMerkleWithProgress(info.uploadId, winner, progressListener(id, isUpload = true))
+                    }
+                } else {
+                    withContext(Dispatchers.IO) {
+                        c.finalizeUploadWithProgress(info.uploadId, txHashes, progressListener(id, isUpload = true))
+                    }
                 }
-                // Gas was paid by the external wallet (not ant-core), so read it
-                // back from the approve + payForQuotes receipts.
-                val gas = gasSpentEth(evm.rpcUrl, listOf(approveTx, payTx))
-                val cost = "${r.chunksStored} chunk(s) · ${formatAtto(info.totalAmount)} ANT" +
-                    (gas?.let { " · $it ETH gas" } ?: "")
+                val costLabel = if (info.paymentType == "merkle") "${r.chunksStored} chunk(s) · merkle"
+                    else "${r.chunksStored} chunk(s) · ${formatAtto(info.totalAmount)} ANT"
+                val gas = gasEthOrNull(gasWei)
+                val cost = costLabel + (gas?.let { " · $it ETH gas" } ?: "")
                 completeUpload(id, visibility, r.address ?: info.dataMapAddress, r.dataMap, cost, context)
             } catch (e: Throwable) {
                 setUpload(id) { it.copy(status = FileStatus.Failed, error = e.message, stage = null) }
@@ -349,87 +358,10 @@ object FilesStore {
         }
     }
 
-    /// Merkle payment path: approve → `payForMerkleTree` → read the winning pool
-    /// from the `MerklePaymentMade` event → finalize with that winner hash.
-    /// Unlike the wave path there's a single vault call and the total cost isn't
-    /// known until the contract picks a winner, so we approve a safe upper bound.
-    private suspend fun runMerklePayment(
-        id: Long, info: PreparedUploadInfo, visibility: String, evm: DevnetEvm, c: Client, context: Context,
-    ) {
-        val pools = info.poolCommitments.map { pc ->
-            EthCalldata.PoolCommitment(
-                poolHash = pc.poolHash,
-                candidates = pc.candidates.map {
-                    EthCalldata.MerkleCandidate(rewardsAddress = it.rewardsAddress, amount = it.amount)
-                },
-            )
-        }
-
-        // The contract charges `median16(winnerPool)·2^depth` via transferFrom;
-        // median16 ≤ the largest candidate amount, so max·2^depth always suffices
-        // to approve without reimplementing the on-chain winner/median logic.
-        val approveAmount = merkleApproveUpperBound(info)
-
-        setUpload(id) { it.copy(status = FileStatus.AwaitingApproval) }
-        val approveTx = withContext(Dispatchers.Main) {
-            evm.chainId?.let { WalletConnectManager.switchChain(it) }
-            WalletConnectManager.sendTransaction(
-                to = evm.tokenAddress,
-                data = EthCalldata.approve(evm.vaultAddress, approveAmount),
-            )
-        }
-        waitForReceipt(evm.rpcUrl, approveTx)
-
-        setUpload(id) { it.copy(status = FileStatus.Paying) }
-        val payData = EthCalldata.payForMerkleTree(
-            depth = info.depth.toInt(),
-            poolCommitments = pools,
-            timestamp = info.merklePaymentTimestamp.toLong().toBigInteger(),
-        )
-        val payTx = withContext(Dispatchers.Main) {
-            WalletConnectManager.sendTransaction(to = evm.vaultAddress, data = payData)
-        }
-        waitForReceipt(evm.rpcUrl, payTx)
-
-        // The winning pool is selected on-chain — recover its hash from the
-        // MerklePaymentMade log; finalizeUploadMerkle needs it.
-        val winnerPoolHash = parseWinnerPoolHash(evm.rpcUrl, payTx)
-            ?: throw RuntimeException("payForMerkleTree receipt had no MerklePaymentMade event")
-
-        setUpload(id) {
-            it.copy(status = FileStatus.Uploading, stage = "storing", stageDone = 0, stageTotal = 0)
-        }
-        val r = withContext(Dispatchers.IO) {
-            c.finalizeUploadMerkleWithProgress(info.uploadId, winnerPoolHash, progressListener(id, isUpload = true))
-        }
-        // Gas was paid by the external wallet (not ant-core); read it back from
-        // the approve + payForMerkleTree receipts. Exact ANT is what the vault
-        // pulled, which we don't reparse — label it "merkle".
-        val gas = gasSpentEth(evm.rpcUrl, listOf(approveTx, payTx))
-        val cost = "${r.chunksStored} chunk(s) · merkle" + (gas?.let { " · $it ETH gas" } ?: "")
-        completeUpload(id, visibility, r.address ?: info.dataMapAddress, r.dataMap, cost, context)
-    }
-
     /// A valid 32-byte winner hash for the already-stored merkle case, where the
     /// FFI accepts any hash (no payment was made). Prefer a real pool hash.
     private fun anyWinnerHash(info: PreparedUploadInfo): String =
         info.poolCommitments.firstOrNull()?.poolHash ?: "0x" + "0".repeat(64)
-
-    /// Pull the indexed `winnerPoolHash` (topics[1]) out of the MerklePaymentMade
-    /// log in a payForMerkleTree receipt. It's already a 0x-prefixed 32-byte hash.
-    private suspend fun parseWinnerPoolHash(rpcUrl: String, txHash: String): String? {
-        val body = """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":["$txHash"]}"""
-        val resp = try { withContext(Dispatchers.IO) { httpPost(rpcUrl, body) } } catch (e: Exception) { return null }
-        val logs = JSONObject(resp).optJSONObject("result")?.optJSONArray("logs") ?: return null
-        val topic0 = EthCalldata.MERKLE_PAYMENT_MADE_TOPIC0.lowercase()
-        for (i in 0 until logs.length()) {
-            val topics = logs.getJSONObject(i).optJSONArray("topics") ?: continue
-            if (topics.length() >= 2 && topics.getString(0).lowercase() == topic0) {
-                return topics.getString(1)
-            }
-        }
-        return null
-    }
 
     private fun completeUpload(
         id: Long, visibility: String, address: String?, dataMapHex: String, cost: String, context: Context,
@@ -584,69 +516,33 @@ object FilesStore {
 
     // ---- Manifest / receipts ----
 
-    private data class DevnetEvm(
-        val rpcUrl: String,
-        val tokenAddress: String,
-        val vaultAddress: String,
-        val chainId: Long?,
-    )
+    private data class DevnetEvm(val rpcUrl: String, val chainId: Long)
 
+    /// Read the devnet RPC + chain id from the manifest. Token/vault addresses no
+    /// longer come from here — the SDK's `paymentTransactions` supplies each tx's
+    /// `to`. The chain id is taken from the manifest when present, else defaults
+    /// to Arbitrum Sepolia (the external-signer devnet), replacing the old
+    /// RPC-string guess.
     private fun parseManifestEvm(): DevnetEvm {
         val json = JSONObject(File(manifestPath()).readText())
         val evm = json.getJSONObject("evm")
-        val rpc = evm.getString("rpc_url")
-        val chainId = when {
-            rpc.contains("sepolia", ignoreCase = true) -> 421614L
-            rpc.contains("arb1") || rpc.contains("arbitrum.io/rpc") -> 42161L
-            else -> null
-        }
-        return DevnetEvm(rpc, evm.getString("payment_token_address"),
-            evm.getString("payment_vault_address"), chainId)
+        val chainId = evm.optLong("chain_id", 0L).takeIf { it != 0L } ?: 421614L
+        return DevnetEvm(evm.getString("rpc_url"), chainId)
     }
 
-    /// Poll the EVM RPC until a tx is mined (nodes verify payment on-chain, and
-    /// MetaMask estimates the next call against confirmed state).
-    private suspend fun waitForReceipt(rpcUrl: String, txHash: String, timeoutMs: Long = 60_000) {
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
-            val body = """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":["$txHash"]}"""
-            val resp = try { withContext(Dispatchers.IO) { httpPost(rpcUrl, body) } } catch (e: Exception) { null }
-            if (resp != null) {
-                val result = JSONObject(resp).optJSONObject("result")
-                when (result?.optString("status")) {
-                    "0x1" -> return
-                    "0x0" -> throw RuntimeException("payment transaction reverted on-chain")
-                }
-            }
-            delay(1500)
-        }
-        throw RuntimeException("timed out waiting for transaction to confirm")
+    /// Gas spent (wei) for a receipt: `gasUsed × effectiveGasPrice` (base-10
+    /// decimal strings from the SDK's `TxReceipt`).
+    private fun weiOf(r: TxReceipt): java.math.BigInteger {
+        val used = r.gasUsed.toBigIntegerOrNull() ?: java.math.BigInteger.ZERO
+        val price = r.effectiveGasPrice.toBigIntegerOrNull() ?: java.math.BigInteger.ZERO
+        return used.multiply(price)
     }
 
-    /// Total gas spent (ETH) across the given tx hashes, from their receipts
-    /// (`gasUsed × effectiveGasPrice`). Null if none could be read.
-    private suspend fun gasSpentEth(rpcUrl: String, txHashes: List<String>): String? {
-        var totalWei = java.math.BigInteger.ZERO
-        for (h in txHashes) {
-            val body = """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":["$h"]}"""
-            val resp = try { withContext(Dispatchers.IO) { httpPost(rpcUrl, body) } } catch (e: Exception) { null } ?: continue
-            val result = JSONObject(resp).optJSONObject("result") ?: continue
-            val used = result.optString("gasUsed").removePrefix("0x").toBigIntegerOrNull(16) ?: continue
-            val price = result.optString("effectiveGasPrice").removePrefix("0x").toBigIntegerOrNull(16) ?: continue
-            totalWei = totalWei.add(used.multiply(price))
-        }
-        if (totalWei.signum() == 0) return null
-        return java.math.BigDecimal(totalWei).movePointLeft(18)
+    /// Format accumulated wei as an ETH string, or null when nothing was spent.
+    private fun gasEthOrNull(wei: java.math.BigInteger): String? {
+        if (wei.signum() == 0) return null
+        return java.math.BigDecimal(wei).movePointLeft(18)
             .setScale(6, java.math.RoundingMode.HALF_UP).toPlainString()
-    }
-
-    private fun httpPost(urlStr: String, body: String): String {
-        val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"; doOutput = true; connectTimeout = 10_000; readTimeout = 10_000
-            setRequestProperty("Content-Type", "application/json")
-        }
-        conn.outputStream.use { it.write(body.toByteArray()) }
-        return conn.inputStream.bufferedReader().use { it.readText() }
     }
 
     // ---- mutation helpers (replace-by-id keeps the list observable) ----
