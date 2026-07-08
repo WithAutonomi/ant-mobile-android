@@ -122,6 +122,47 @@ object FilesStore {
         }
     }
 
+    /// Background liveness: while a devnet host is set, poll its HTTP API. If it
+    /// goes unreachable the badge flips to Failed (the devnet died), and when it
+    /// returns we auto-reconnect — so the indicator reflects reality instead of
+    /// staying green after the devnet stops. Started once from attach(). (No-op
+    /// on the adb-push path, which has no API to probe.)
+    @Volatile private var livenessStarted = false
+    private fun startLivenessPoll() {
+        if (livenessStarted) return
+        livenessStarted = true
+        scope.launch {
+            while (true) {
+                delay(6000)
+                val host = devnetHost()
+                if (host.isEmpty()) continue
+                val alive = apiAlive(host)
+                if (!alive && connection is ConnectionStatus.Connected) {
+                    esClient = null
+                    walletClient = null
+                    withContext(Dispatchers.Main) {
+                        connection = ConnectionStatus.Failed("devnet unreachable")
+                    }
+                } else if (alive && connection is ConnectionStatus.Failed) {
+                    withContext(Dispatchers.Main) { connectNetwork() }
+                }
+            }
+        }
+    }
+
+    /// Cheap reachability check against the devnet's manifest HTTP API.
+    private fun apiAlive(host: String): Boolean = try {
+        val conn = (URL("http://$host/api/info").openConnection() as HttpURLConnection).apply {
+            connectTimeout = 3000
+            readTimeout = 3000
+        }
+        val ok = conn.responseCode == 200
+        conn.disconnect()
+        ok
+    } catch (_: Throwable) {
+        false
+    }
+
     /// Force a fresh connection attempt (drops the cached client so a previously
     /// failed build is retried, not reused).
     fun retryConnection() {
@@ -549,7 +590,10 @@ object FilesStore {
 
     /// Wire the application context so transfers can keep a foreground service
     /// alive while backgrounded. Call once from the Activity.
-    fun attach(context: Context) { appContext = context.applicationContext }
+    fun attach(context: Context) {
+        appContext = context.applicationContext
+        startLivenessPoll()
+    }
 
     /// Number of uploads + downloads currently in progress. Read by the transfer
     /// service to decide whether to keep running (it reconciles against this on
