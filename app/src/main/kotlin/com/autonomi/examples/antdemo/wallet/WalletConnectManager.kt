@@ -230,10 +230,6 @@ object WalletConnectManager {
         runCatching { rpc("wallet_switchEthereumChain", """[{"chainId":"$hex"}]""") }
     }
 
-    /// Convenience: ERC-20 `approve(vault, amount)` on the token contract.
-    suspend fun sendApprove(chain: AutonomiChain, amount: String = "0"): String =
-        sendTransaction(to = chain.tokenAddress, data = EthCalldata.approve(chain.paymentVaultAddress, amount))
-
     private object Delegate : AppKit.ModalDelegate {
         override fun onSessionApproved(approvedSession: Modal.Model.ApprovedSession) { refreshAccount() }
         override fun onSessionRejected(rejectedSession: Modal.Model.RejectedSession) {}

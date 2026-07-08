@@ -40,7 +40,7 @@ android {
 dependencies {
     // Published SDK from the ant-maven repo (see settings.gradle.kts). The POM
     // brings JNA + kotlinx-coroutines-core transitively.
-    implementation("com.autonomi:ant-android:0.0.3")
+    implementation("com.autonomi:ant-android:0.0.4")
     // coroutines-android (Dispatchers.Main) isn't transitive from the SDK.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
