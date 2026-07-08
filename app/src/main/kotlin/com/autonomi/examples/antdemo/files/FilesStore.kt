@@ -449,35 +449,44 @@ object FilesStore {
         }
     }
 
-    /// Save a private upload's datamap to the public **Downloads** folder so it
-    /// survives and is openable in any file manager — it's the only record of a
-    /// private upload. Returns a `content://` Uri (API 29+) or a file path
-    /// (older) for the "Open file" action, or null on failure.
-    private fun saveDatamapToDownloads(context: Context, filename: String, contents: String): String? = try {
+    /// Save bytes to the public **Downloads** folder (MediaStore on API 29+, app
+    /// storage otherwise), so downloaded files and private-upload datamaps land
+    /// somewhere the user can actually find them. Returns a `content://` Uri /
+    /// file path for the "Open file" action, or null on failure. `write` receives
+    /// the destination stream.
+    private fun saveToDownloads(
+        context: Context,
+        filename: String,
+        mimeType: String,
+        write: (java.io.OutputStream) -> Unit,
+    ): String? = try {
         if (Build.VERSION.SDK_INT >= 29) {
             val values = ContentValues().apply {
                 put(MediaStore.Downloads.DISPLAY_NAME, filename)
-                put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+                put(MediaStore.Downloads.MIME_TYPE, mimeType)
                 put(MediaStore.Downloads.IS_PENDING, 1)
             }
             val resolver = context.contentResolver
             val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
             if (uri == null) null else {
-                resolver.openOutputStream(uri)?.use { it.write(contents.toByteArray()) }
+                resolver.openOutputStream(uri)?.use { write(it) }
                 values.clear()
                 values.put(MediaStore.Downloads.IS_PENDING, 0)
                 resolver.update(uri, values, null, null)
                 uri.toString()
             }
         } else {
-            // Pre-scoped-storage: keep the datamap in app storage (public
-            // Downloads would need WRITE_EXTERNAL_STORAGE).
-            val dir = File(context.filesDir, "datamaps").apply { mkdirs() }
-            File(dir, filename).apply { writeText(contents) }.absolutePath
+            // Pre-scoped-storage: keep it in app storage (public Downloads would
+            // need WRITE_EXTERNAL_STORAGE).
+            val dir = File(context.filesDir, "downloads").apply { mkdirs() }
+            File(dir, filename).apply { outputStream().use { write(it) } }.absolutePath
         }
     } catch (_: Throwable) {
         null
     }
+
+    private fun saveDatamapToDownloads(context: Context, filename: String, contents: String): String? =
+        saveToDownloads(context, filename, "application/octet-stream") { it.write(contents.toByteArray()) }
 
     /// Devnet fallback: the manifest wallet pays inside ant-core (single-shot).
     private suspend fun devnetUpload(id: Long, bytes: ByteArray) {
@@ -520,18 +529,26 @@ object FilesStore {
         scope.launch {
             try {
                 val c = externalSignerClient()
-                val dir = File(context.filesDir, "downloads").apply { mkdirs() }
-                val out = File(dir, fileName)
+                // The FFI writes to a real file path (MediaStore has none), so
+                // download to a temp file, then copy it into public Downloads.
+                val tmp = File(context.cacheDir, fileName)
                 val written = withContext(Dispatchers.IO) {
                     if (addressHex != null) {
-                        c.downloadPublicToFile(addressHex, out.absolutePath, progressListener(id, isUpload = false))
+                        c.downloadPublicToFile(addressHex, tmp.absolutePath, progressListener(id, isUpload = false))
                     } else {
-                        c.downloadPrivateToFile(dataMapHex!!, out.absolutePath, progressListener(id, isUpload = false))
+                        c.downloadPrivateToFile(dataMapHex!!, tmp.absolutePath, progressListener(id, isUpload = false))
                     }
+                }
+                val saved = withContext(Dispatchers.IO) {
+                    saveToDownloads(context, fileName, "application/octet-stream") { out ->
+                        tmp.inputStream().use { it.copyTo(out) }
+                    }.also { tmp.delete() }
                 }
                 setDownload(id) {
                     it.copy(status = FileStatus.Downloaded, stage = null,
-                        sizeBytes = written.toLong(), savedTo = out.absolutePath)
+                        sizeBytes = written.toLong(),
+                        savedTo = if (saved != null) "Download/$fileName" else tmp.absolutePath,
+                        dataMapFile = saved)
                 }
             } catch (e: Throwable) {
                 setDownload(id) { it.copy(status = FileStatus.Failed, error = e.message, stage = null) }
