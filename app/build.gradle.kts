@@ -38,14 +38,9 @@ android {
 }
 
 dependencies {
-    // LOCAL TEST OVERRIDE: locally-built AAR carrying the LAN FFI fix
-    // (connect_from_devnet_manifest .local(!lan)). Revert to the Maven coord
-    // once ant-android ships a release with the fix. A bare files() AAR has no
-    // POM, so its transitive deps (JNA, coroutines-core) are declared explicitly.
-    implementation(files("libs/ant-android-release.aar"))
-    implementation("net.java.dev.jna:jna:5.14.0@aar")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
-    // implementation("com.autonomi:ant-android:0.0.3")
+    // Published SDK from the ant-maven repo (see settings.gradle.kts). The POM
+    // brings JNA + kotlinx-coroutines-core transitively.
+    implementation("com.autonomi:ant-android:0.0.3")
     // coroutines-android (Dispatchers.Main) isn't transitive from the SDK.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
