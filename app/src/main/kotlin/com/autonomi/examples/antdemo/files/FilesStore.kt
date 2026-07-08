@@ -521,8 +521,14 @@ object FilesStore {
         val key = addressHex ?: "datamap"
         val id = ids.getAndIncrement()
         val shortAddr = if (key.length > 10) "${key.take(10)}…" else key
-        val rowName = suggestedName ?: "download-$shortAddr"
-        val fileName = suggestedName ?: "download-${key.take(16)}.bin"
+        // A datamap file is named "<original>.datamap"; strip that suffix so the
+        // downloaded file restores the original name + extension.
+        val cleanName = suggestedName?.let {
+            if (dataMapHex != null && it.endsWith(".datamap", ignoreCase = true))
+                it.dropLast(".datamap".length) else it
+        }
+        val rowName = cleanName ?: "download-$shortAddr"
+        val fileName = cleanName ?: "download-${key.take(16)}.bin"
         downloads.add(0, FileEntry(id, FileKind.Download, rowName, 0, FileStatus.Downloading,
             System.currentTimeMillis(), address = addressHex, stage = "downloading"))
         syncTransferService()
