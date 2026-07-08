@@ -53,8 +53,45 @@ sealed interface ConnectionStatus {
 /// through the bundled AntFfi AAR, with a quote → approve two-step upload and
 /// live progress via the FFI's ProgressListener.
 object FilesStore {
-    /// Devnet manifest pushed to the device (see README wiring step).
-    private const val MANIFEST_PATH = "/data/local/tmp/devnet-manifest.json"
+    /// Devnet host serving the manifest API (Developer settings), e.g.
+    /// `192.168.0.62:8088`. Empty → use the adb-pushed file (back-compat).
+    private fun devnetHost(): String =
+        appContext?.getSharedPreferences("antdemo", Context.MODE_PRIVATE)
+            ?.getString("devnetHost", "")?.trim().orEmpty()
+
+    /// Path the FFI/parse read. With a devnet host set, the manifest is fetched
+    /// into app storage (writable); otherwise the adb-pushed file in
+    /// /data/local/tmp (read-only — the legacy delivery, no host needed).
+    private fun manifestPath(): String {
+        val ctx = appContext
+        return if (devnetHost().isNotEmpty() && ctx != null)
+            File(ctx.filesDir, "devnet-manifest.json").absolutePath
+        else
+            "/data/local/tmp/devnet-manifest.json"
+    }
+
+    /// Fetch the manifest from the devnet host's HTTP API into app storage, so
+    /// the device needs no `adb push` and re-fetches on reconnect. No-op when
+    /// no host is set. Blocking — call from an IO coroutine.
+    private fun ensureManifest() {
+        val host = devnetHost()
+        if (host.isEmpty()) return
+        val ctx = appContext ?: return
+        try {
+            val conn = (URL("http://$host/api/devnet-manifest.json")
+                .openConnection() as HttpURLConnection).apply {
+                connectTimeout = 4000
+                readTimeout = 4000
+            }
+            if (conn.responseCode == 200) {
+                val data = conn.inputStream.use { it.readBytes() }
+                File(ctx.filesDir, "devnet-manifest.json").writeBytes(data)
+            }
+            conn.disconnect()
+        } catch (_: Throwable) {
+            // Keep any previously-fetched manifest on a transient failure.
+        }
+    }
 
     val uploads = mutableStateListOf<FileEntry>()
     val downloads = mutableStateListOf<FileEntry>()
@@ -74,6 +111,7 @@ object FilesStore {
         if (connection is ConnectionStatus.Connecting || connection is ConnectionStatus.Connected) return
         connection = ConnectionStatus.Connecting
         scope.launch {
+            ensureManifest()
             val next = try {
                 externalSignerClient()
                 ConnectionStatus.Connected
@@ -101,11 +139,11 @@ object FilesStore {
     @Volatile private var esClient: Client? = null
 
     private suspend fun client(): Client = clientLock.withLock {
-        walletClient ?: Client.connectFromDevnetManifest(MANIFEST_PATH).also { walletClient = it }
+        walletClient ?: Client.connectFromDevnetManifest(manifestPath()).also { walletClient = it }
     }
 
     private suspend fun externalSignerClient(): Client = clientLock.withLock {
-        esClient ?: Client.connectFromDevnetManifestExternalSigner(MANIFEST_PATH).also { esClient = it }
+        esClient ?: Client.connectFromDevnetManifestExternalSigner(manifestPath()).also { esClient = it }
     }
 
     // ---- Uploads: quote → approve ----
@@ -433,7 +471,7 @@ object FilesStore {
     )
 
     private fun parseManifestEvm(): DevnetEvm {
-        val json = JSONObject(File(MANIFEST_PATH).readText())
+        val json = JSONObject(File(manifestPath()).readText())
         val evm = json.getJSONObject("evm")
         val rpc = evm.getString("rpc_url")
         val chainId = when {

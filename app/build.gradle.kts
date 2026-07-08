@@ -29,9 +29,14 @@ android {
 }
 
 dependencies {
-    // Autonomi SDK from the ant-maven Pages repo (declared in settings.gradle.kts).
-    // Pulls JNA + kotlinx-coroutines-core transitively via its POM.
-    implementation("com.autonomi:ant-android:0.0.3")
+    // LOCAL TEST OVERRIDE: locally-built AAR carrying the LAN FFI fix
+    // (connect_from_devnet_manifest .local(!lan)). Revert to the Maven coord
+    // once ant-android ships a release with the fix. A bare files() AAR has no
+    // POM, so its transitive deps (JNA, coroutines-core) are declared explicitly.
+    implementation(files("libs/ant-android-release.aar"))
+    implementation("net.java.dev.jna:jna:5.14.0@aar")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
+    // implementation("com.autonomi:ant-android:0.0.3")
     // coroutines-android (Dispatchers.Main) isn't transitive from the SDK.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
