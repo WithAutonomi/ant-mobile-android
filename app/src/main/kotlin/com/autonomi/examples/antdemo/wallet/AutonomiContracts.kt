@@ -20,9 +20,10 @@ enum class AutonomiChain(
     ),
     ARBITRUM_SEPOLIA(
         chainId = 421614,
-        // TODO(spike): set from your devnet manifest before testing on Sepolia.
-        tokenAddress = "0x0000000000000000000000000000000000000000",
-        paymentVaultAddress = "0x0000000000000000000000000000000000000000",
+        // Deployed ArbitrumSepoliaTest contracts (evmlib::Network::ArbitrumSepoliaTest),
+        // matching the devnet manifest's evm.payment_token / payment_vault.
+        tokenAddress = "0x4bc1aCE0E66170375462cB4E6Af42Ad4D5EC689C",
+        paymentVaultAddress = "0xd742e8cfef27a9a884f3effa239ee2f39c276522",
     );
 
     /// CAIP-2 id used to build a WalletConnect `eip155:<id>` blockchain.

@@ -33,6 +33,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -51,6 +52,11 @@ import androidx.compose.ui.unit.sp
 @Composable
 fun UploadsScreen() {
     val context = LocalContext.current
+    // Uploads must be payable: either a wallet is connected (external signer) or
+    // the manifest carries a funded key (local-Anvil devnet). Otherwise disable.
+    val walletConnected = com.autonomi.examples.antdemo.wallet.WalletConnectManager
+        .state.collectAsState().value.address != null
+    val canUpload = walletConnected || FilesStore.manifestHasKey
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri ?: return@rememberLauncherForActivityResult
         val name = queryDisplayName(context, uri)
@@ -63,7 +69,12 @@ fun UploadsScreen() {
         verticalArrangement = Arrangement.spacedBy(10.dp),
         contentPadding = PaddingValues(bottom = 24.dp),
     ) {
-        item { Button(onClick = { picker.launch("*/*") }) { Text("Upload a file") } }
+        item { Button(enabled = canUpload, onClick = { picker.launch("*/*") }) { Text("Upload a file") } }
+        if (!canUpload) {
+            item {
+                InfoBar("This devnet is paid via a connected wallet. Connect one in the Wallet tab to upload.")
+            }
+        }
         if (FilesStore.uploads.isEmpty()) {
             item { EmptyState("No uploads yet", "Tap “Upload a file” to store data on the network") }
         } else {
@@ -156,6 +167,22 @@ fun DownloadsScreen() {
 
 // ---- shared row rendering ----
 
+/// Inline info bar (e.g. why uploads are disabled).
+@Composable
+private fun InfoBar(text: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("ⓘ", modifier = Modifier.padding(end = 8.dp), color = MaterialTheme.colorScheme.primary)
+        Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
 @Composable
 private fun EmptyState(title: String, subtitle: String) {
     Column(
@@ -200,6 +227,14 @@ private fun FileRow(entry: FileEntry) {
             Text(formatDate(entry.createdAt), style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
+        // Full error on its own wrapping line (the badge stays a short pill so the
+        // row layout doesn't blow out when the message is long).
+        if (entry.status == FileStatus.Failed) {
+            entry.error?.let { err ->
+                Text(err, style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error, modifier = Modifier.fillMaxWidth())
+            }
+        }
         if (entry.status.inProgress) {
             val p = entry.progress
             if (p != null) {
@@ -235,7 +270,10 @@ private fun FileRow(entry: FileEntry) {
 
 /// Share a saved datamap file with another app via FileProvider.
 private fun openFile(context: Context, path: String) {
-    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(path))
+    // Datamaps saved to public Downloads are a content:// Uri (MediaStore);
+    // older/app-internal paths still go through FileProvider.
+    val uri = if (path.startsWith("content://")) Uri.parse(path)
+        else FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(path))
     val intent = Intent(Intent.ACTION_SEND).apply {
         type = "application/octet-stream"
         putExtra(Intent.EXTRA_STREAM, uri)
@@ -254,7 +292,7 @@ private fun StatusBadge(entry: FileEntry) {
         else -> MaterialTheme.colorScheme.primary to MaterialTheme.colorScheme.onPrimary
     }
     Text(
-        entry.statusText(),
+        entry.status.label,
         style = MaterialTheme.typography.labelSmall,
         color = fg,
         modifier = Modifier

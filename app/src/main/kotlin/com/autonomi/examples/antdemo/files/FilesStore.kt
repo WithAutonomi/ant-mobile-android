@@ -1,6 +1,9 @@
 package com.autonomi.examples.antdemo.files
 
+import android.content.ContentValues
 import android.content.Context
+import android.os.Build
+import android.provider.MediaStore
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -93,6 +96,16 @@ object FilesStore {
         }
     }
 
+    /// Recompute manifest-derived flags (e.g. whether it has a funded key).
+    private fun refreshManifestFlags() {
+        manifestHasKey = try {
+            val evm = JSONObject(File(manifestPath()).readText()).optJSONObject("evm")
+            !(evm?.optString("wallet_private_key").isNullOrBlank())
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     val uploads = mutableStateListOf<FileEntry>()
     val downloads = mutableStateListOf<FileEntry>()
 
@@ -104,6 +117,12 @@ object FilesStore {
     var connection by mutableStateOf<ConnectionStatus>(ConnectionStatus.Idle)
         private set
 
+    /// Whether the current manifest carries a funded wallet key (local-Anvil
+    /// devnet). False for a Sepolia devnet (empty key → external wallet needed).
+    /// Drives whether uploads are possible without a connected wallet.
+    var manifestHasKey by mutableStateOf(false)
+        private set
+
     /// Join the Autonomi network (build + start the P2P client from the devnet
     /// manifest) and track status for the indicator. Idempotent — a no-op while
     /// already connecting or connected. Called at launch and by the Retry action.
@@ -112,6 +131,7 @@ object FilesStore {
         connection = ConnectionStatus.Connecting
         scope.launch {
             ensureManifest()
+            withContext(Dispatchers.Main) { refreshManifestFlags() }
             val next = try {
                 externalSignerClient()
                 ConnectionStatus.Connected
@@ -415,18 +435,48 @@ object FilesStore {
         id: Long, visibility: String, address: String?, dataMapHex: String, cost: String, context: Context,
     ) {
         var dataMapFile: String? = null
+        var savedTo: String? = null
         if (visibility == "private") {
-            val dir = File(context.filesDir, "datamaps").apply { mkdirs() }
             val name = uploads.firstOrNull { it.id == id }?.name ?: "upload"
-            val out = File(dir, "$name.datamap")
-            out.writeText(dataMapHex)
-            dataMapFile = out.absolutePath
+            val filename = "$name.datamap"
+            dataMapFile = saveDatamapToDownloads(context, filename, dataMapHex)
+            if (dataMapFile != null) savedTo = "Download/$filename"
         }
         setUpload(id) {
             it.copy(status = FileStatus.Complete, stage = null,
                 address = if (visibility == "public") address else null,
-                dataMapFile = dataMapFile, cost = cost)
+                dataMapFile = dataMapFile, savedTo = savedTo, cost = cost)
         }
+    }
+
+    /// Save a private upload's datamap to the public **Downloads** folder so it
+    /// survives and is openable in any file manager — it's the only record of a
+    /// private upload. Returns a `content://` Uri (API 29+) or a file path
+    /// (older) for the "Open file" action, or null on failure.
+    private fun saveDatamapToDownloads(context: Context, filename: String, contents: String): String? = try {
+        if (Build.VERSION.SDK_INT >= 29) {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, filename)
+                put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val resolver = context.contentResolver
+            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            if (uri == null) null else {
+                resolver.openOutputStream(uri)?.use { it.write(contents.toByteArray()) }
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+                uri.toString()
+            }
+        } else {
+            // Pre-scoped-storage: keep the datamap in app storage (public
+            // Downloads would need WRITE_EXTERNAL_STORAGE).
+            val dir = File(context.filesDir, "datamaps").apply { mkdirs() }
+            File(dir, filename).apply { writeText(contents) }.absolutePath
+        }
+    } catch (_: Throwable) {
+        null
     }
 
     /// Devnet fallback: the manifest wallet pays inside ant-core (single-shot).
