@@ -1,6 +1,9 @@
 package com.autonomi.examples.antdemo.files
 
+import android.content.ContentValues
 import android.content.Context
+import android.os.Build
+import android.provider.MediaStore
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -53,8 +56,55 @@ sealed interface ConnectionStatus {
 /// through the bundled AntFfi AAR, with a quote → approve two-step upload and
 /// live progress via the FFI's ProgressListener.
 object FilesStore {
-    /// Devnet manifest pushed to the device (see README wiring step).
-    private const val MANIFEST_PATH = "/data/local/tmp/devnet-manifest.json"
+    /// Devnet host serving the manifest API (Developer settings), e.g.
+    /// `192.168.0.62:8088`. Empty → use the adb-pushed file (back-compat).
+    private fun devnetHost(): String =
+        appContext?.getSharedPreferences("antdemo", Context.MODE_PRIVATE)
+            ?.getString("devnetHost", "")?.trim().orEmpty()
+
+    /// Path the FFI/parse read. With a devnet host set, the manifest is fetched
+    /// into app storage (writable); otherwise the adb-pushed file in
+    /// /data/local/tmp (read-only — the legacy delivery, no host needed).
+    private fun manifestPath(): String {
+        val ctx = appContext
+        return if (devnetHost().isNotEmpty() && ctx != null)
+            File(ctx.filesDir, "devnet-manifest.json").absolutePath
+        else
+            "/data/local/tmp/devnet-manifest.json"
+    }
+
+    /// Fetch the manifest from the devnet host's HTTP API into app storage, so
+    /// the device needs no `adb push` and re-fetches on reconnect. No-op when
+    /// no host is set. Blocking — call from an IO coroutine.
+    private fun ensureManifest() {
+        val host = devnetHost()
+        if (host.isEmpty()) return
+        val ctx = appContext ?: return
+        try {
+            val conn = (URL("http://$host/api/devnet-manifest.json")
+                .openConnection() as HttpURLConnection).apply {
+                connectTimeout = 4000
+                readTimeout = 4000
+            }
+            if (conn.responseCode == 200) {
+                val data = conn.inputStream.use { it.readBytes() }
+                File(ctx.filesDir, "devnet-manifest.json").writeBytes(data)
+            }
+            conn.disconnect()
+        } catch (_: Throwable) {
+            // Keep any previously-fetched manifest on a transient failure.
+        }
+    }
+
+    /// Recompute manifest-derived flags (e.g. whether it has a funded key).
+    private fun refreshManifestFlags() {
+        manifestHasKey = try {
+            val evm = JSONObject(File(manifestPath()).readText()).optJSONObject("evm")
+            !(evm?.optString("wallet_private_key").isNullOrBlank())
+        } catch (_: Throwable) {
+            false
+        }
+    }
 
     val uploads = mutableStateListOf<FileEntry>()
     val downloads = mutableStateListOf<FileEntry>()
@@ -67,6 +117,12 @@ object FilesStore {
     var connection by mutableStateOf<ConnectionStatus>(ConnectionStatus.Idle)
         private set
 
+    /// Whether the current manifest carries a funded wallet key (local-Anvil
+    /// devnet). False for a Sepolia devnet (empty key → external wallet needed).
+    /// Drives whether uploads are possible without a connected wallet.
+    var manifestHasKey by mutableStateOf(false)
+        private set
+
     /// Join the Autonomi network (build + start the P2P client from the devnet
     /// manifest) and track status for the indicator. Idempotent — a no-op while
     /// already connecting or connected. Called at launch and by the Retry action.
@@ -74,6 +130,8 @@ object FilesStore {
         if (connection is ConnectionStatus.Connecting || connection is ConnectionStatus.Connected) return
         connection = ConnectionStatus.Connecting
         scope.launch {
+            ensureManifest()
+            withContext(Dispatchers.Main) { refreshManifestFlags() }
             val next = try {
                 externalSignerClient()
                 ConnectionStatus.Connected
@@ -82,6 +140,47 @@ object FilesStore {
             }
             withContext(Dispatchers.Main) { connection = next }
         }
+    }
+
+    /// Background liveness: while a devnet host is set, poll its HTTP API. If it
+    /// goes unreachable the badge flips to Failed (the devnet died), and when it
+    /// returns we auto-reconnect — so the indicator reflects reality instead of
+    /// staying green after the devnet stops. Started once from attach(). (No-op
+    /// on the adb-push path, which has no API to probe.)
+    @Volatile private var livenessStarted = false
+    private fun startLivenessPoll() {
+        if (livenessStarted) return
+        livenessStarted = true
+        scope.launch {
+            while (true) {
+                delay(6000)
+                val host = devnetHost()
+                if (host.isEmpty()) continue
+                val alive = apiAlive(host)
+                if (!alive && connection is ConnectionStatus.Connected) {
+                    esClient = null
+                    walletClient = null
+                    withContext(Dispatchers.Main) {
+                        connection = ConnectionStatus.Failed("devnet unreachable")
+                    }
+                } else if (alive && connection is ConnectionStatus.Failed) {
+                    withContext(Dispatchers.Main) { connectNetwork() }
+                }
+            }
+        }
+    }
+
+    /// Cheap reachability check against the devnet's manifest HTTP API.
+    private fun apiAlive(host: String): Boolean = try {
+        val conn = (URL("http://$host/api/info").openConnection() as HttpURLConnection).apply {
+            connectTimeout = 3000
+            readTimeout = 3000
+        }
+        val ok = conn.responseCode == 200
+        conn.disconnect()
+        ok
+    } catch (_: Throwable) {
+        false
     }
 
     /// Force a fresh connection attempt (drops the cached client so a previously
@@ -101,11 +200,11 @@ object FilesStore {
     @Volatile private var esClient: Client? = null
 
     private suspend fun client(): Client = clientLock.withLock {
-        walletClient ?: Client.connectFromDevnetManifest(MANIFEST_PATH).also { walletClient = it }
+        walletClient ?: Client.connectFromDevnetManifest(manifestPath()).also { walletClient = it }
     }
 
     private suspend fun externalSignerClient(): Client = clientLock.withLock {
-        esClient ?: Client.connectFromDevnetManifestExternalSigner(MANIFEST_PATH).also { esClient = it }
+        esClient ?: Client.connectFromDevnetManifestExternalSigner(manifestPath()).also { esClient = it }
     }
 
     // ---- Uploads: quote → approve ----
@@ -336,19 +435,65 @@ object FilesStore {
         id: Long, visibility: String, address: String?, dataMapHex: String, cost: String, context: Context,
     ) {
         var dataMapFile: String? = null
+        var savedTo: String? = null
         if (visibility == "private") {
-            val dir = File(context.filesDir, "datamaps").apply { mkdirs() }
             val name = uploads.firstOrNull { it.id == id }?.name ?: "upload"
-            val out = File(dir, "$name.datamap")
-            out.writeText(dataMapHex)
-            dataMapFile = out.absolutePath
+            val filename = "$name.datamap"
+            dataMapFile = saveDatamapToDownloads(context, filename, dataMapHex)
+            if (dataMapFile != null) savedTo = "Download/$filename"
         }
         setUpload(id) {
             it.copy(status = FileStatus.Complete, stage = null,
                 address = if (visibility == "public") address else null,
-                dataMapFile = dataMapFile, cost = cost)
+                dataMapFile = dataMapFile, savedTo = savedTo, cost = cost)
         }
     }
+
+    /// Save bytes to the public **Downloads** folder (MediaStore on API 29+, app
+    /// storage otherwise), so downloaded files and private-upload datamaps land
+    /// somewhere the user can actually find them. Returns a `content://` Uri /
+    /// file path for the "Open file" action, or null on failure. `write` receives
+    /// the destination stream.
+    private fun saveToDownloads(
+        context: Context,
+        filename: String,
+        mimeType: String,
+        write: (java.io.OutputStream) -> Unit,
+    ): String? = try {
+        if (Build.VERSION.SDK_INT >= 29) {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, filename)
+                put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val resolver = context.contentResolver
+            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            if (uri == null) null else {
+                resolver.openOutputStream(uri)?.use { write(it) }
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+                uri.toString()
+            }
+        } else {
+            // Pre-scoped-storage: keep it in app storage (public Downloads would
+            // need WRITE_EXTERNAL_STORAGE).
+            val dir = File(context.filesDir, "downloads").apply { mkdirs() }
+            File(dir, filename).apply { outputStream().use { write(it) } }.absolutePath
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
+    private fun saveDatamapToDownloads(context: Context, filename: String, contents: String): String? =
+        saveToDownloads(context, filename, "application/octet-stream") { it.write(contents.toByteArray()) }
+
+    /// Best-effort MIME from a filename extension so a saved download indexes in
+    /// the gallery and opens in the right default app. Falls back to octet-stream.
+    private fun mimeOf(name: String): String =
+        android.webkit.MimeTypeMap.getSingleton()
+            .getMimeTypeFromExtension(name.substringAfterLast('.', "").lowercase())
+            ?: "application/octet-stream"
 
     /// Devnet fallback: the manifest wallet pays inside ant-core (single-shot).
     private suspend fun devnetUpload(id: Long, bytes: ByteArray) {
@@ -383,26 +528,40 @@ object FilesStore {
         val key = addressHex ?: "datamap"
         val id = ids.getAndIncrement()
         val shortAddr = if (key.length > 10) "${key.take(10)}…" else key
-        val rowName = suggestedName ?: "download-$shortAddr"
-        val fileName = suggestedName ?: "download-${key.take(16)}.bin"
+        // A datamap file is named "<original>.datamap"; strip that suffix so the
+        // downloaded file restores the original name + extension.
+        val cleanName = suggestedName?.let {
+            if (dataMapHex != null && it.endsWith(".datamap", ignoreCase = true))
+                it.dropLast(".datamap".length) else it
+        }
+        val rowName = cleanName ?: "download-$shortAddr"
+        val fileName = cleanName ?: "download-${key.take(16)}.bin"
         downloads.add(0, FileEntry(id, FileKind.Download, rowName, 0, FileStatus.Downloading,
             System.currentTimeMillis(), address = addressHex, stage = "downloading"))
         syncTransferService()
         scope.launch {
             try {
                 val c = externalSignerClient()
-                val dir = File(context.filesDir, "downloads").apply { mkdirs() }
-                val out = File(dir, fileName)
+                // The FFI writes to a real file path (MediaStore has none), so
+                // download to a temp file, then copy it into public Downloads.
+                val tmp = File(context.cacheDir, fileName)
                 val written = withContext(Dispatchers.IO) {
                     if (addressHex != null) {
-                        c.downloadPublicToFile(addressHex, out.absolutePath, progressListener(id, isUpload = false))
+                        c.downloadPublicToFile(addressHex, tmp.absolutePath, progressListener(id, isUpload = false))
                     } else {
-                        c.downloadPrivateToFile(dataMapHex!!, out.absolutePath, progressListener(id, isUpload = false))
+                        c.downloadPrivateToFile(dataMapHex!!, tmp.absolutePath, progressListener(id, isUpload = false))
                     }
+                }
+                val saved = withContext(Dispatchers.IO) {
+                    saveToDownloads(context, fileName, mimeOf(fileName)) { out ->
+                        tmp.inputStream().use { it.copyTo(out) }
+                    }.also { tmp.delete() }
                 }
                 setDownload(id) {
                     it.copy(status = FileStatus.Downloaded, stage = null,
-                        sizeBytes = written.toLong(), savedTo = out.absolutePath)
+                        sizeBytes = written.toLong(),
+                        savedTo = if (saved != null) "Download/$fileName" else tmp.absolutePath,
+                        dataMapFile = saved)
                 }
             } catch (e: Throwable) {
                 setDownload(id) { it.copy(status = FileStatus.Failed, error = e.message, stage = null) }
@@ -433,7 +592,7 @@ object FilesStore {
     )
 
     private fun parseManifestEvm(): DevnetEvm {
-        val json = JSONObject(File(MANIFEST_PATH).readText())
+        val json = JSONObject(File(manifestPath()).readText())
         val evm = json.getJSONObject("evm")
         val rpc = evm.getString("rpc_url")
         val chainId = when {
@@ -511,7 +670,10 @@ object FilesStore {
 
     /// Wire the application context so transfers can keep a foreground service
     /// alive while backgrounded. Call once from the Activity.
-    fun attach(context: Context) { appContext = context.applicationContext }
+    fun attach(context: Context) {
+        appContext = context.applicationContext
+        startLivenessPoll()
+    }
 
     /// Number of uploads + downloads currently in progress. Read by the transfer
     /// service to decide whether to keep running (it reconciles against this on

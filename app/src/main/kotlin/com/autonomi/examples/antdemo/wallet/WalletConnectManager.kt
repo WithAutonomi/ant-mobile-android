@@ -80,11 +80,30 @@ object WalletConnectManager {
             _state.value = _state.value.copy(status = "AppKit init error: ${error.throwable.message}")
         }
 
-        // Advertise Arbitrum One/Sepolia from the presets (keyed/identified by
-        // CAIP-2). Fall back to all preset chains if the ids aren't present.
-        val wanted = setOf(AutonomiChain.ARBITRUM_ONE.caip2, AutonomiChain.ARBITRUM_SEPOLIA.caip2)
-        val all = AppKitChainsPresets.ethChains.values.toList()
-        val chains = all.filter { it.id in wanted }.ifEmpty { all }
+        // Advertise ONLY the devnet's chain (Arbitrum Sepolia) so the
+        // WalletConnect session is on it and payments can't land on mainnet.
+        // Arbitrum Sepolia is NOT one of Reown's chain presets, so we can't just
+        // filter for it (that yielded an empty set → fell back to *all* presets →
+        // wallet connected on Ethereum mainnet). Build it by cloning the Arbitrum
+        // One preset (reusing its methods/events/token/image) and overriding the
+        // reference + RPC. Fall back to all presets only if the base is missing.
+        val base = AppKitChainsPresets.ethChains.values
+            .firstOrNull { it.id == AutonomiChain.ARBITRUM_ONE.caip2 }
+        val sepolia = base?.let {
+            Modal.Model.Chain(
+                chainName = "Arbitrum Sepolia",
+                chainNamespace = it.chainNamespace,
+                chainReference = AutonomiChain.ARBITRUM_SEPOLIA.chainId.toString(),
+                requiredMethods = it.requiredMethods,
+                optionalMethods = it.optionalMethods,
+                events = it.events,
+                token = it.token,
+                chainImage = it.chainImage,
+                rpcUrl = "https://sepolia-rollup.arbitrum.io/rpc",
+                blockExplorerUrl = "https://sepolia.arbiscan.io",
+            )
+        }
+        val chains = listOfNotNull(sepolia).ifEmpty { AppKitChainsPresets.ethChains.values.toList() }
         AppKit.setChains(chains)
 
         AppKit.setDelegate(Delegate)

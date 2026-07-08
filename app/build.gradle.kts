@@ -3,6 +3,15 @@ plugins {
     id("org.jetbrains.kotlin.android") version "1.9.25"
 }
 
+// Reown 1.4.1's ChaChaPolyCodec throws "OutputLengthException: Output buffer too
+// short" when decrypting relay messages against bcprov 1.78.x (stricter AEAD
+// output-buffer handling). Reown's own BOM pulls 1.78.1; pin back to 1.77.
+configurations.all {
+    resolutionStrategy {
+        force("org.bouncycastle:bcprov-jdk18on:1.77")
+    }
+}
+
 android {
     namespace = "com.autonomi.examples.antdemo"
     compileSdk = 34
@@ -29,8 +38,8 @@ android {
 }
 
 dependencies {
-    // Autonomi SDK from the ant-maven Pages repo (declared in settings.gradle.kts).
-    // Pulls JNA + kotlinx-coroutines-core transitively via its POM.
+    // Published SDK from the ant-maven repo (see settings.gradle.kts). The POM
+    // brings JNA + kotlinx-coroutines-core transitively.
     implementation("com.autonomi:ant-android:0.0.3")
     // coroutines-android (Dispatchers.Main) isn't transitive from the SDK.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")

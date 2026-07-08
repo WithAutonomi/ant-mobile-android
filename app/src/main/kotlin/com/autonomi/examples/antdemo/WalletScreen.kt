@@ -73,26 +73,6 @@ fun WalletScreen(navController: NavController) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-
-        if (wallet.address != null) {
-            Card {
-                Text("Payment test", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-                Text(
-                    "Signs a real payment-vault approve (amount 0 → gas only).",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Button(onClick = {
-                    scope.launch {
-                        runCatching { WalletConnectManager.sendApprove(AutonomiChain.ARBITRUM_ONE, "0") }
-                    }
-                }) { Text("Send test approve tx (Arbitrum One)") }
-                wallet.lastTxHash?.let { hash ->
-                    SelectionContainer {
-                        Text("tx: $hash", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
-                    }
-                }
-            }
-        }
     }
 }
 
