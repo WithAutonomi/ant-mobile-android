@@ -80,11 +80,17 @@ object WalletConnectManager {
             _state.value = _state.value.copy(status = "AppKit init error: ${error.throwable.message}")
         }
 
-        // Advertise Arbitrum One/Sepolia from the presets (keyed/identified by
-        // CAIP-2). Fall back to all preset chains if the ids aren't present.
-        val wanted = setOf(AutonomiChain.ARBITRUM_ONE.caip2, AutonomiChain.ARBITRUM_SEPOLIA.caip2)
-        val all = AppKitChainsPresets.ethChains.values.toList()
-        val chains = all.filter { it.id in wanted }.ifEmpty { all }
+        // Advertise ONLY the devnet's chain (Arbitrum Sepolia) to the wallet.
+        // Offering mainnet too let MetaMask negotiate a mainnet-only session and
+        // silently sign the payment on Arbitrum One, while the app polls the
+        // Sepolia RPC for the receipt → "timed out waiting for transaction to
+        // confirm". Proposing only Sepolia forces the wallet onto the manifest's
+        // chain (it prompts to add the network if missing), so payments and the
+        // nodes' on-chain verification happen on the same chain.
+        val devnetChain = AutonomiChain.ARBITRUM_SEPOLIA
+        val chains = AppKitChainsPresets.ethChains.values
+            .filter { it.id == devnetChain.caip2 }
+            .ifEmpty { AppKitChainsPresets.ethChains.values.toList() }
         AppKit.setChains(chains)
 
         AppKit.setDelegate(Delegate)
