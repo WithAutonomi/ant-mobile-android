@@ -65,7 +65,7 @@ fun UploadConfirmDialog() {
                 // File row
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text(pending.name, style = MaterialTheme.typography.bodyMedium)
-                    Text(formatSize(pending.bytes.size.toLong()),
+                    Text(formatSize(pending.sizeBytes),
                         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
 
@@ -80,12 +80,20 @@ fun UploadConfirmDialog() {
                     when {
                         pending.error != null ->
                             Text(pending.error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-                        pending.quoting || info == null ->
+                        pending.quoting || info == null -> {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 CircularProgressIndicator(modifier = Modifier.padding(2.dp), strokeWidth = 2.dp)
                                 Text("Obtaining quote from network…", style = MaterialTheme.typography.bodyMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
+                            // Show the fast sampled estimate (if it landed) while the
+                            // full quote is still running, so the user sees a ballpark.
+                            pending.estimate?.let { est ->
+                                costRow("Estimated cost", estimateLabel(est), accent = true)
+                                Text("Quick estimate from a sample of the file — the exact cost fills in once quoting finishes.",
+                                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
                         info.alreadyStored -> {
                             Text("Already stored on the network — free",
                                 style = MaterialTheme.typography.bodyMedium, color = Color(0xFF22C55E), fontWeight = FontWeight.Medium)

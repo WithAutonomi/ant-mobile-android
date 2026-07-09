@@ -20,6 +20,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import uniffi.ant_ffi.Client
+import uniffi.ant_ffi.CostEstimate
 import uniffi.ant_ffi.PreparedUploadInfo
 import uniffi.ant_ffi.ProgressListener
 import uniffi.ant_ffi.ProgressUpdate
@@ -37,9 +38,14 @@ import java.util.concurrent.atomic.AtomicLong
 data class PendingUpload(
     val id: Long,
     val name: String,
-    val bytes: ByteArray,
+    /// Path to the picked file copied into the app cache. The upload streams
+    /// from disk (file-path FFI) instead of holding the file in memory.
+    val path: String,
+    val sizeBytes: Long,
     val visibility: String,          // "private" | "public"
     val info: PreparedUploadInfo?,   // null while (re)quoting
+    /// Fast sampled cost estimate shown while the full quote is still running.
+    val estimate: CostEstimate?,
     val quoting: Boolean,
     val error: String?,
 )
@@ -214,23 +220,26 @@ object FilesStore {
     /// Step 1: stage a file and start quoting. Opens the confirm dialog
     /// (`pendingUpload`). With no wallet connected, falls back to the devnet
     /// single-shot put immediately (nothing to sign).
-    fun stageUpload(name: String, bytes: ByteArray, context: Context) {
+    fun stageUpload(name: String, path: String, context: Context) {
         val id = ids.getAndIncrement()
-        uploads.add(0, FileEntry(id, FileKind.Upload, name, bytes.size.toLong(),
+        val sizeBytes = File(path).length()
+        uploads.add(0, FileEntry(id, FileKind.Upload, name, sizeBytes,
             FileStatus.Quoting, System.currentTimeMillis()))
         syncTransferService()
         if (WalletConnectManager.state.value.address == null) {
             scope.launch {
-                try { devnetUpload(id, bytes) }
+                try { devnetUpload(id, path) }
                 catch (e: Throwable) { setUpload(id) { it.copy(status = FileStatus.Failed, error = e.message) } }
+                finally { cleanupTemp(path) }
             }
             return
         }
-        pendingUpload = PendingUpload(id, name, bytes, "private", null, quoting = true, error = null)
+        pendingUpload = PendingUpload(id, name, path, sizeBytes, "private", null, null, quoting = true, error = null)
         quote(id)
     }
 
-    /// Flip visibility and re-quote (public pays for one extra chunk).
+    /// Flip visibility and re-quote (public pays for one extra chunk). The
+    /// sampled estimate is visibility-independent, so it's kept.
     fun setPendingVisibility(vis: String) {
         val p = pendingUpload ?: return
         if (p.visibility == vis) return
@@ -238,13 +247,31 @@ object FilesStore {
         quote(p.id)
     }
 
+    /// Best-effort removal of a staged upload's cache copy once it's no longer
+    /// needed (completed, cancelled, or failed).
+    private fun cleanupTemp(path: String?) {
+        if (path != null) runCatching { File(path).delete() }
+    }
+
     private fun quote(id: Long) {
         val pending = pendingUpload ?: return
+        val path = pending.path
         setUpload(id) { it.copy(status = FileStatus.Quoting) }
         scope.launch {
             try {
                 val c = externalSignerClient()
-                val info = withContext(Dispatchers.IO) { c.prepareDataUpload(pending.bytes, pending.visibility) }
+                // Fast sampled estimate first, so the dialog shows a ballpark cost
+                // immediately instead of a bare spinner. Fetch once — it doesn't
+                // depend on visibility.
+                if (pendingUpload?.id == id && pendingUpload?.estimate == null) {
+                    val est = runCatching {
+                        withContext(Dispatchers.IO) { c.estimateFileCost(path, "auto") }
+                    }.getOrNull()
+                    if (est != null) {
+                        pendingUpload?.let { if (it.id == id) pendingUpload = it.copy(estimate = est) }
+                    }
+                }
+                val info = withContext(Dispatchers.IO) { c.prepareFileUpload(path, pending.visibility) }
                 val p = pendingUpload ?: return@launch
                 if (p.id != id) return@launch
                 pendingUpload = p.copy(info = info, quoting = false)
@@ -265,13 +292,14 @@ object FilesStore {
         val p = pendingUpload ?: return
         val addr = p.info?.dataMapAddress ?: return
         val id = p.id
+        cleanupTemp(p.path)
         pendingUpload = null
         setUpload(id) { it.copy(status = FileStatus.Complete, stage = null, address = addr, cost = "already stored") }
     }
 
     /// Cancel the pending upload (dismiss the dialog, drop the row).
     fun cancelPending() {
-        pendingUpload?.let { p -> uploads.removeAll { it.id == p.id } }
+        pendingUpload?.let { p -> uploads.removeAll { it.id == p.id }; cleanupTemp(p.path) }
         pendingUpload = null
     }
 
@@ -281,6 +309,7 @@ object FilesStore {
         val info = p.info ?: return
         val id = p.id
         val visibility = p.visibility
+        val tmpPath = p.path
         pendingUpload = null
         scope.launch {
             try {
@@ -354,6 +383,8 @@ object FilesStore {
                 completeUpload(id, visibility, r.address ?: info.dataMapAddress, r.dataMap, cost, context)
             } catch (e: Throwable) {
                 setUpload(id) { it.copy(status = FileStatus.Failed, error = e.message, stage = null) }
+            } finally {
+                cleanupTemp(tmpPath)
             }
         }
     }
@@ -428,13 +459,12 @@ object FilesStore {
             ?: "application/octet-stream"
 
     /// Devnet fallback: the manifest wallet pays inside ant-core (single-shot).
-    private suspend fun devnetUpload(id: Long, bytes: ByteArray) {
+    private suspend fun devnetUpload(id: Long, path: String) {
         val c = client()
         setUpload(id) { it.copy(status = FileStatus.Uploading) }
-        val result = withContext(Dispatchers.IO) { c.dataPutPublic(bytes, "auto") }
+        val result = withContext(Dispatchers.IO) { c.fileUploadPublic(path, "auto") }
         setUpload(id) {
-            it.copy(status = FileStatus.Complete, address = result.address,
-                cost = "${result.chunksStored} chunk(s) · ${result.paymentModeUsed}")
+            it.copy(status = FileStatus.Complete, address = result.address, cost = "uploaded")
         }
     }
 
