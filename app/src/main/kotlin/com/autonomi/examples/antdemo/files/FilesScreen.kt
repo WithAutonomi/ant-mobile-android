@@ -60,8 +60,16 @@ fun UploadsScreen() {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri ?: return@rememberLauncherForActivityResult
         val name = queryDisplayName(context, uri)
-        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-        if (bytes != null) FilesStore.stageUpload(name, bytes, context)
+        // Copy the picked content:// into app cache so we have a real file path;
+        // the upload streams from disk (file-path FFI) instead of loading the
+        // whole file into memory.
+        val temp = File(context.cacheDir, "upload-${System.currentTimeMillis()}-$name")
+        val ok = runCatching {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                temp.outputStream().use { input.copyTo(it) }
+            } != null
+        }.getOrDefault(false)
+        if (ok) FilesStore.stageUpload(name, temp.absolutePath, context)
     }
 
     LazyColumn(

@@ -115,5 +115,13 @@ fun merkleApproveUpperBound(info: uniffi.ant_ffi.PreparedUploadInfo): String {
     return maxAmt.shiftLeft(info.depth.toInt()).toString()
 }
 
+/// Render a CostEstimate honoring its confidence — never present a best-effort
+/// "0" as a firm free price.
+fun estimateLabel(est: uniffi.ant_ffi.CostEstimate): String = when (est.confidence) {
+    "verified_all_already_stored" -> "already stored — free"
+    "all_samples_already_stored_incomplete" -> "likely already stored"
+    else -> "~${formatAtto(est.storageCostAtto)} ANT"
+}
+
 private val dateFmt = SimpleDateFormat("MMM d, HH:mm", Locale.US)
 fun formatDate(epochMillis: Long): String = dateFmt.format(Date(epochMillis))
