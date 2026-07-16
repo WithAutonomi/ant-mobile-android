@@ -63,16 +63,28 @@ fetches `http://<host>/api/devnet-manifest.json` over HTTP and polls
   point the devnet host at the machine's LAN IP. Cross-device LAN devnet works
   with the **released** SDK (needs `ant-android` ≥ 0.0.7) — the SDK's
   `connectFromDevnetManifest*` auto-detects a LAN vs loopback manifest and binds
-  `0.0.0.0` when a non-loopback bootstrap addr is present. No upstream ant-node
-  change is required.
+  `0.0.0.0` when a non-loopback bootstrap addr is present.
 - **Emulator:** `127.0.0.1` inside the emulator is the emulator, not the host,
   and the NAT does not reliably establish QUIC to loopback-bound devnet services —
   prefer a physical device on the LAN. (Historical NAT-rewrite recipe using
   `10.0.2.2` is no longer the supported path.)
 
-To stand up a LAN/Sepolia devnet, see
-[`ant-lan-devnet`](https://github.com/Nic-dorman/ant-lan-devnet) (`ant-devnet
---host <ip> --serve-port 8088`).
+To stand up a LAN devnet, use the `ant-devnet` harness in
+[`ant-node`](https://github.com/WithAutonomi/ant-node) (≥ v0.14.4; not shipped
+in the release tarballs — run it from a source checkout):
+
+```sh
+# Anvil-backed LAN devnet (embedded local EVM — frictionless, no wallet needed):
+cargo run --release --bin ant-devnet -- --preset small --enable-evm \
+  --host <lan-ip> --serve-port 8088
+
+# Arbitrum Sepolia-backed LAN devnet (real external-signer paid flow):
+cargo run --release --bin ant-devnet -- --preset small \
+  --host <lan-ip> --evm-network arbitrum-sepolia --serve-port 8088
+```
+
+`--host` makes the nodes advertise your LAN IP; `--serve-port` exposes the
+manifest API this app fetches (`/api/devnet-manifest.json` + `/api/info`).
 
 ## Build & run
 
